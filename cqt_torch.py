@@ -1,7 +1,599 @@
 import torch
 import torchaudio
 import math
-from typing import Optional, Union, Callable
+from typing import Optional, Union, Callable, List, Tuple, Sequence
+# import interval_frequencies from librosa in 
+from librosa.core.intervals import interval_frequencies
+import numpy as np
+
+
+fmin_def = 32.70319566257483  # C1 note frequency
+def cqt(
+    y: torch.Tensor,
+    *,
+    sr: float = 22050,
+    hop_length: int = 512,
+    fmin: Optional[float] = None,
+    n_bins: int = 84,
+    bins_per_octave: int = 12,
+    tuning: Optional[float] = 0.0,
+    filter_scale: float = 1,
+    norm: Optional[float] = 1,
+    sparsity: float = 0.01,
+    window: Union[str, Callable] = "hann",
+    scale: bool = True,
+    pad_mode: str = "constant",
+    res_type: Optional[str] = "kaiser_best",
+    dtype: Optional[torch.dtype] = None,
+    device: Optional[torch.device] = None,
+) -> torch.Tensor:
+    """
+    Compute the constant-Q transform of an audio signal using PyTorch.
+    
+    This is a special case of VQT with gamma=0.
+    """
+    return vqt(
+        y=y,
+        sr=sr,
+        hop_length=hop_length,
+        fmin=fmin,
+        n_bins=n_bins,
+        intervals="equal",
+        gamma=0,
+        bins_per_octave=bins_per_octave,
+        tuning=tuning,
+        filter_scale=filter_scale,
+        norm=norm,
+        sparsity=sparsity,
+        window=window,
+        scale=scale,
+        pad_mode=pad_mode,
+        res_type=res_type,
+        dtype=dtype,
+        device=device,
+    )
+
+def hybrid_cqt(
+    y: torch.Tensor,
+    *,
+    sr: float = 22050,
+    hop_length: int = 512,
+    fmin: Optional[float] = None,
+    n_bins: int = 84,
+    bins_per_octave: int = 12,
+    tuning: Optional[float] = 0.0,
+    filter_scale: float = 1,
+    norm: Optional[float] = 1,
+    sparsity: float = 0.01,
+    window: Union[str, Callable] = "hann",
+    scale: bool = True,
+    pad_mode: str = "constant",
+    res_type: str = "kaiser_best",
+    dtype: Optional[torch.dtype] = None,
+    device: Optional[torch.device] = None,
+) -> torch.Tensor:
+    """
+    Compute the hybrid constant-Q transform of an audio signal using PyTorch.
+    """
+    if device is None:
+        device = y.device
+        
+    if dtype is None:
+        dtype = torch.complex64
+
+    if fmin is None:
+        fmin = fmin_def  # C1 note frequency
+
+    if tuning is None:
+        #tuning = estimate_tuning(y=y, sr=sr, bins_per_octave=bins_per_octave)  # Need to implement
+        tuning = 0.0
+
+    # Apply tuning correction
+    fmin = fmin * 2.0 ** (tuning / bins_per_octave)
+
+    # Get all CQT frequencies
+    freqs = cqt_frequencies(n_bins, fmin=fmin, bins_per_octave=bins_per_octave)
+
+    # Pre-compute alpha
+    if n_bins == 1:
+        alpha = _et_relative_bw(bins_per_octave)
+    else:
+        alpha = _relative_bandwidth(freqs=freqs)
+
+    # Compute filter lengths
+    lengths, _ = wavelet_lengths(
+        freqs=freqs,
+        sr=sr,
+        filter_scale=filter_scale,
+        window=window,
+        alpha=alpha,
+        device=device
+    )
+
+    # Determine which filters to use with Pseudo CQT
+    pseudo_filters = (2.0 ** torch.ceil(torch.log2(lengths)) < 2 * hop_length)
+    n_bins_pseudo = int(torch.sum(pseudo_filters).item())
+    n_bins_full = n_bins - n_bins_pseudo
+    
+    cqt_resp = []
+
+    if n_bins_pseudo > 0:
+        fmin_pseudo = torch.min(freqs[pseudo_filters]).item()
+
+        cqt_resp.append(
+            pseudo_cqt(  # Need to implement
+                y,
+                sr=sr,
+                hop_length=hop_length,
+                fmin=fmin_pseudo,
+                n_bins=n_bins_pseudo,
+                bins_per_octave=bins_per_octave,
+                filter_scale=filter_scale,
+                norm=norm,
+                sparsity=sparsity,
+                window=window,
+                scale=scale,
+                pad_mode=pad_mode,
+                dtype=dtype,
+                device=device
+            )
+        )
+
+    if n_bins_full > 0:
+        cqt_resp.append(
+            torch.abs(
+                cqt(  # Need to implement
+                    y,
+                    sr=sr,
+                    hop_length=hop_length,
+                    fmin=fmin,
+                    n_bins=n_bins_full,
+                    bins_per_octave=bins_per_octave,
+                    filter_scale=filter_scale,
+                    norm=norm,
+                    sparsity=sparsity,
+                    window=window,
+                    scale=scale,
+                    pad_mode=pad_mode,
+                    res_type=res_type,
+                    dtype=dtype,
+                    device=device
+                )
+            )
+        )
+
+    return _trim_stack(cqt_resp, n_bins, dtype)
+
+def pseudo_cqt(
+    y: torch.Tensor,
+    *,
+    sr: float = 22050,
+    hop_length: int = 512,
+    fmin: Optional[float] = None,
+    n_bins: int = 84,
+    bins_per_octave: int = 12,
+    tuning: Optional[float] = 0.0,
+    filter_scale: float = 1,
+    norm: Optional[float] = 1,
+    sparsity: float = 0.01,
+    window: Union[str, Callable] = "hann",
+    scale: bool = True,
+    pad_mode: str = "constant",
+    dtype: Optional[torch.dtype] = None,
+    device: Optional[torch.device] = None,
+) -> torch.Tensor:
+    """
+    Compute the pseudo constant-Q transform of an audio signal using PyTorch.
+    """
+    if device is None:
+        device = y.device
+        
+    if fmin is None:
+        fmin = fmin_def
+
+    if tuning is None:
+        tuning = estimate_tuning(y=y, sr=sr, bins_per_octave=bins_per_octave)  # Need to implement
+
+    if dtype is None:
+        dtype = torch.complex64 if y.dtype == torch.float32 else torch.complex64
+
+    # Apply tuning correction
+    fmin = fmin * 2.0 ** (tuning / bins_per_octave)
+
+    # Get frequencies
+    freqs = cqt_frequencies(
+        n_bins=n_bins,
+        fmin=fmin,
+        bins_per_octave=bins_per_octave,
+        device=device
+    )
+
+    # Compute alpha
+    if n_bins == 1:
+        alpha = _et_relative_bw(bins_per_octave)
+    else:
+        alpha = _relative_bandwidth(freqs=freqs)
+
+    # Get filter lengths
+    lengths, _ = wavelet_lengths(
+        freqs=freqs,
+        sr=sr,
+        window=window,
+        filter_scale=filter_scale,
+        alpha=alpha,
+        device=device
+    )
+
+    # Get FFT basis
+    fft_basis, n_fft, _ = _vqt_filter_fft(
+        sr,
+        freqs,
+        filter_scale,
+        norm,
+        sparsity,
+        hop_length=hop_length,
+        window=window,
+        dtype=dtype,
+        alpha=alpha,
+        device=device
+    )
+
+    # Take magnitude of FFT basis
+    fft_basis = torch.abs(fft_basis)
+
+    # Compute magnitude-only CQT response
+    C = _cqt_response(
+        y,
+        n_fft,
+        hop_length,
+        fft_basis,
+        pad_mode,
+        window="hann",
+        dtype=dtype,
+        phase=False,
+        device=device
+    )
+
+    if scale:
+        C = C / torch.sqrt(torch.tensor(n_fft, dtype=C.dtype, device=device))
+    else:
+        # Reshape lengths to match dimensions
+        lengths = _expand_to(lengths, ndim=C.dim(), axes=-2)
+        C = C * torch.sqrt(lengths / n_fft)
+
+    return C
+
+def vqt(
+    y: torch.Tensor,
+    *,
+    sr: float = 22050,
+    hop_length: int = 512,
+    fmin: Optional[float] = None,
+    n_bins: int = 84,
+    intervals: Union[str, Sequence[float]] = "equal",
+    gamma: Optional[float] = None,
+    bins_per_octave: int = 12,
+    tuning: Optional[float] = 0.0,
+    filter_scale: float = 1,
+    norm: Optional[float] = 1,
+    sparsity: float = 0.01,
+    window: Union[str, Callable] = "hann",
+    scale: bool = True,
+    pad_mode: str = "constant",
+    res_type: Optional[str] = "kaiser_best",
+    dtype: Optional[torch.dtype] = None,
+    device: Optional[torch.device] = None,
+) -> torch.Tensor:
+    """
+    Compute the variable-Q transform of an audio signal using PyTorch.
+    """
+    if device is None:
+        device = y.device
+        
+    # Handle intervals
+    if not isinstance(intervals, str):
+        bins_per_octave = len(intervals)
+
+    # Calculate octaves
+    n_octaves = int(torch.ceil(torch.tensor(n_bins / bins_per_octave)).item())
+    n_filters = min(bins_per_octave, n_bins)
+
+    if fmin is None:
+        fmin = fmin_def
+
+    if tuning is None:
+        tuning = estimate_tuning(y=y, sr=sr, bins_per_octave=bins_per_octave)  # Need to implement
+
+    if dtype is None:
+        dtype = torch.complex64 if y.dtype == torch.float32 else torch.complex64
+
+    # Apply tuning correction
+    fmin = fmin * 2.0 ** (tuning / bins_per_octave)
+
+    # Get frequencies
+    # freqs = interval_frequencies(  # Need to implement
+    #     n_bins=n_bins,
+    #     fmin=fmin,
+    #     intervals=intervals,
+    #     bins_per_octave=bins_per_octave,
+    #     sort=True,
+    #     device=device
+    # )
+    # call the librosa one actually, converting any to numpy where necessary
+    freqs_np = interval_frequencies(n_bins=n_bins, fmin=fmin, bins_per_octave=bins_per_octave, intervals=intervals)
+    #conv to float
+    freqs_np = freqs_np.astype(np.float32)
+    freqs = torch.tensor(freqs_np, device=device)
+
+    freqs_top = freqs[-bins_per_octave:]
+    fmax_t = torch.max(freqs_top).item()
+
+    # Compute alpha
+    if n_bins == 1:
+        alpha = _et_relative_bw(bins_per_octave)
+    else:
+        alpha = _relative_bandwidth(freqs=freqs)
+
+    # Get filter lengths
+    lengths, filter_cutoff = wavelet_lengths(
+        freqs=freqs,
+        sr=sr,
+        window=window,
+        filter_scale=filter_scale,
+        gamma=gamma,
+        alpha=alpha,
+        device=device
+    )
+
+    # Check Nyquist frequency
+    nyquist = sr / 2.0
+    if filter_cutoff > nyquist:
+        raise ValueError(
+            f"Wavelet basis with max frequency={fmax_t} would exceed the Nyquist "
+            f"frequency={nyquist}. Try reducing the number of frequency bins."
+        )
+
+    # Early downsampling
+    y, sr, hop_length = _early_downsample(
+        y, sr, hop_length, res_type, n_octaves, nyquist, filter_cutoff, scale
+    )
+
+    vqt_resp = []
+    my_y, my_sr, my_hop = y, sr, hop_length
+
+    # Process each octave
+    for i in range(n_octaves):
+        # Get current octave slice
+        if i == 0:
+            sl = slice(-n_filters, None)
+        else:
+            sl = slice(-n_filters * (i + 1), -n_filters * i)
+
+        freqs_oct = freqs[sl]
+        alpha_oct = alpha[sl]
+
+        # Get FFT basis
+        fft_basis, n_fft, _ = _vqt_filter_fft(
+            my_sr,
+            freqs_oct,
+            filter_scale,
+            norm,
+            sparsity,
+            window=window,
+            gamma=gamma,
+            dtype=dtype,
+            alpha=alpha_oct,
+            device=device
+        )
+
+        # Rescale filters
+        fft_basis *= torch.sqrt(torch.tensor(sr / my_sr, device=device))
+
+        # Compute VQT response
+        response = _cqt_response(
+                my_y,
+                n_fft,
+                my_hop,
+                fft_basis,
+                pad_mode,
+                dtype=dtype,
+                device=device
+            )
+
+        vqt_resp.append(response)
+        # Downsample if possible
+        if my_hop % 2 == 0:
+            my_hop //= 2
+            my_sr /= 2.0
+            # my_y = resample(  # Need to implement
+            #     my_y,
+            #     orig_sr=2,
+            #     target_sr=1,
+            #     res_type=res_type,
+            #     scale=True
+            # )
+            my_y = torchaudio.transforms.Resample(orig_freq=2,new_freq=1)(my_y)
+            ratio = 1.0/2.0
+            my_y = my_y / torch.sqrt(torch.tensor(ratio, device=y.device))
+
+    # Stack and trim responses
+    V = _trim_stack(vqt_resp, n_bins, dtype)
+
+    if scale:
+        # Recompute lengths for scaling
+        lengths, _ = wavelet_lengths(
+            freqs=freqs,
+            sr=sr,
+            window=window,
+            filter_scale=filter_scale,
+            gamma=gamma,
+            alpha=alpha,
+            device=device
+        )
+
+        # Reshape lengths and apply scaling
+        lengths = _expand_to(lengths, ndim=V.dim(), axes=-2)
+        V = V / torch.sqrt(lengths)
+
+    return V
+
+def _early_downsample(
+    y: torch.Tensor,
+    sr: float,
+    hop_length: int,
+    res_type: str,
+    n_octaves: int,
+    nyquist: float,
+    filter_cutoff: float,
+    scale: bool
+) -> Tuple[torch.Tensor, float, int]:
+    """
+    Early downsampling stage for VQT computation.
+    """
+    if not scale:
+        return y, sr, hop_length
+
+    # Determine target downsampling rate
+    downsample_count1 = max(0, int(np.ceil(np.log2(nyquist / filter_cutoff)) - 1))
+    downsample_count2 = max(0, int(np.ceil(np.log2(hop_length))) - 1)
+    downsample_count = min(downsample_count1, downsample_count2)
+
+    if downsample_count > 0:
+        downsample_factor = 2 ** (downsample_count)
+        
+        # Resample the signal
+        # y = resample(
+        #     y,
+        #     orig_sr=sr,
+        #     target_sr=sr / downsample_factor,
+        #     res_type=res_type,
+        #     scale=True
+        # )
+        y = torchaudio.transforms.Resample(orig_freq=downsample_factor, new_freq=1)(y)
+
+        
+        sr = sr / downsample_factor
+        hop_length = hop_length // downsample_factor
+
+    return y, sr, hop_length
+
+def _expand_to(
+    x: torch.Tensor,
+    ndim: int,
+    axes: Union[int, Sequence[int]]
+) -> torch.Tensor:
+    """
+    Expand tensor dimensions to match target dimensionality.
+    
+    Parameters
+    ----------
+    x : torch.Tensor
+        Input tensor
+    ndim : int
+        Target number of dimensions
+    axes : int or sequence of ints
+        Axes along which to expand
+        
+    Returns
+    -------
+    x_exp : torch.Tensor
+        Expanded tensor
+    """
+    if isinstance(axes, int):
+        axes = [axes]
+        
+    shape = [1] * ndim
+    for ax in axes:
+        shape[ax] = x.size(0)
+    
+    return x.view(*shape)
+
+def _cqt_response(
+    y: torch.Tensor,
+    n_fft: int,
+    hop_length: int,
+    fft_basis: torch.Tensor,
+    pad_mode: str = "constant",
+    window: str = "ones",
+    dtype: Optional[torch.dtype] = None,
+    phase: bool = True,
+    device: Optional[torch.device] = None,
+) -> torch.Tensor:
+    """
+    Compute the CQT response using STFT and provided filter basis.
+    """
+    if device is None:
+        device = y.device
+        
+    # Compute STFT
+    D = torch.stft(
+        y,
+        n_fft=n_fft,
+        hop_length=hop_length,
+        window=get_window(window, n_fft, device),
+        center=True,
+        pad_mode=pad_mode,
+        normalized=False,
+        onesided=True,
+        return_complex=True
+    )
+
+    # numpy code:
+        # Reshape D to Dr
+    # Dr = D.reshape((-1, D.shape[-2], D.shape[-1]))
+    # output_flat = np.empty(
+    #     (Dr.shape[0], fft_basis.shape[0], Dr.shape[-1]), dtype=D.dtype
+    # )
+
+    # # iterate over channels
+    # #   project fft_basis.dot(Dr[i])
+    # for i in range(Dr.shape[0]):
+    #     output_flat[i] = fft_basis.dot(Dr[i])
+
+    # # reshape Dr to match D's leading dimensions again
+    # shape = list(D.shape)
+    # shape[-2] = fft_basis.shape[0]
+    # return output_flat.reshape(shape)
+
+    # # pytorch version:
+    # # Reshape D to Dr
+    # Dr = D.reshape((-1, D.shape[-2], D.shape[-1]))
+    # output_flat = torch.empty(
+    #     (Dr.shape[0], fft_basis.shape[0], Dr.shape[-1]), dtype=D.dtype, device=device
+    # )
+
+    # # iterate over channels
+    # #   project fft_basis.dot(Dr[i])
+    # for i in range(Dr.shape[0]):
+    #     output_flat[i] = torch.matmul(fft_basis, Dr[i])
+    
+    # # reshape Dr to match D's leading dimensions again
+    # shape = list(D.shape)
+    # shape[-2] = fft_basis.shape[0]
+    # return output_flat.reshape(shape)
+
+    # Project onto CQT basis
+    if phase:
+        C = torch.matmul(fft_basis, D)
+    else:
+        C = torch.matmul(fft_basis, torch.abs(D))
+    
+    return C.to(dtype=dtype)
+
+def _trim_stack(
+    cqt_resp: List[torch.Tensor],
+    n_bins: int,
+    dtype: torch.dtype
+) -> torch.Tensor:
+    """
+    Stack and trim CQT responses in the correct order.
+    """
+    if len(cqt_resp) == 1:
+        return cqt_resp[0]
+    
+    # Reverse the order of responses before concatenating
+    # This ensures lower frequencies (bass) appear at the top
+    return torch.cat(cqt_resp[::-1], dim=-2).to(dtype)
 
 def cqt_frequencies(
     n_bins: int, 
@@ -317,10 +909,8 @@ def _vqt_filter_fft(
         alpha=alpha,
         device=device
     )
-
     # Get next power of 2 for FFT
     n_fft = basis.shape[1]
-
     if hop_length is not None:
         target_length = 2.0 ** (1 + math.ceil(math.log2(hop_length)))
         if n_fft < target_length:
@@ -332,8 +922,7 @@ def _vqt_filter_fft(
     # Compute FFT
     #fft_basis = torch.fft.rfft(basis, n=n_fft, dim=1)
     # fft that can take it complex float
-    fft_basis = torch.fft.fft(basis, n=n_fft, dim=1)
-    
+    fft_basis = torch.fft.fft(basis, n=n_fft, dim=1)[..., :n_fft // 2 + 1]
     # Sparsify the basis
     if sparsity > 0:
         fft_basis = sparsify_rows(fft_basis, quantile=sparsity, dtype=dtype)
@@ -599,7 +1188,7 @@ def icqt(
         device = C.device
 
     if fmin is None:
-        fmin = 32.70319566257483  # C1 note frequency
+        fmin = fmin_def  # C1 note frequency
 
     # Apply tuning correction
     fmin = fmin * 2.0 ** (tuning / bins_per_octave)
@@ -651,7 +1240,6 @@ def icqt(
     for i, (my_sr, my_hop) in enumerate(zip(srs, hops)):
         n_filters = min(bins_per_octave, n_bins - bins_per_octave * i)
         sl = slice(bins_per_octave * i, bins_per_octave * i + n_filters)
-        #print(f'i: {i}, my_sr: {my_sr}, my_hop: {my_hop}, n_filters: {n_filters}, sl: {sl}')
 
         # Get FFT basis
         fft_basis, n_fft, _ = _vqt_filter_fft(
@@ -673,7 +1261,6 @@ def icqt(
         freq_power *= n_fft / lengths[sl]
 
         # Inverse project the basis
-        # print dtypes of inv_basis, C_scale[sl], freq_power, C[..., sl, :]
 
         if scale:
             D_oct = torch.einsum(
