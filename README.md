@@ -14,5 +14,5 @@ hop_length = 256
 bins_per_octave = 64
 
 z = cqt_torch.cqt(audio, sr=sr, hop_length=hop_length, n_bins=9*bins_per_octave, bins_per_octave=bins_per_octave, tuning=0.0)
-z_hat = cqt_torch.icqt(\, sr=sr, hop_length=hop_length, bins_per_octave=bins_per_octave)
+z_hat = cqt_torch.icqt(z, sr=sr, hop_length=hop_length, bins_per_octave=bins_per_octave)
 ```
